@@ -26,26 +26,34 @@
 
 import os
 import shlex
-import subprocess
 import tempfile
+import threading
 import time
 
-
-PIPE_STDOUT = { 'stdout': subprocess.PIPE, 'stderr': None, 'stream': 1 }
-PIPE_STDERR = { 'stdout': None, 'stderr': subprocess.PIPE, 'stream': 2 }
-PIPE_BOTH = { 'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT,
-             'stream': 1 }
-PIPE_STDOUT_QUIET = { 'stdout': subprocess.PIPE, 'stderr': subprocess.DEVNULL,
-                     'stream': 1 }
-PIPE_STDERR_QUIET = { 'stdout': subprocess.DEVNULL, 'stderr': subprocess.PIPE,
-                     'stream': 2 }
+from subprocess import Popen, DEVNULL, PIPE, STDOUT
 
 
-class Command:
-    def __init__(self, command, cwd=None, env=None, text=None,
-                 pipe=PIPE_STDOUT):
+PIPE_STDOUT = { 'stdout': PIPE, 'stderr': None, 'stream': 1 }
+PIPE_STDERR = { 'stdout': None, 'stderr': PIPE, 'stream': 2 }
+PIPE_BOTH = { 'stdout': PIPE, 'stderr': STDOUT, 'stream': 1 }
+PIPE_STDOUT_QUIET = { 'stdout': PIPE, 'stderr': DEVNULL, 'stream': 1 }
+PIPE_STDERR_QUIET = { 'stdout': DEVNULL, 'stderr': PIPE, 'stream': 2 }
+
+
+class SubCommand:
+    def __init__(self, command, stdout=PIPE, stderr=PIPE, cwd=None,
+                 base_env=None, export=None, text=True, stream=0):
         '''
-        Constructor
+        Constructor.
+
+        command    --  Command to execute (as sequence or str)
+        stdout     --  Standard output stream (or None, PIPE, DEVNULL)
+        stderr     --  Standard error stream (or None, PIPE, DEVNULL, STDOUT)
+        cwd        --  Change working directory before execution
+        base_env   --  Base environment (None to use default environment)
+        export     --  Dict of additional environment variables for command
+        text       --  Use text streams for command I/O
+        stream     --  For pipelines, 1=stdout, 2=stderr of previous command
         '''
 
         self.command = command
@@ -53,43 +61,28 @@ class Command:
             self.command = shlex.split(command)
         #
 
-        self.cwd = cwd
-        self.env = env
-        self.text = text
+        self.stdout = stdout
+        self.stderr = stderr
 
-        self.stdin = None
-        self.stdout = pipe['stdout']
-        self.stderr = pipe['stderr']
-        self.stream = pipe['stream']
+        self.cwd = cwd
+        self.env = self._build_env(base_env, export)
+        self.text = text
+        self.stream = stream
 
         self.subproc = None
-        self.stream = None
-    #
-#
-
-
-class Pipeline:
-    def __init__(self, stdin=None, stdin_text=False, stderr=None, cwd=None,
-                 env=None, export=None, text=True):
-        '''
-        Constructor
-        '''
-
-        self.pipe_stdin = pipe_stdin
-        if stdin_text:
-            self.pipe_stdin = tempfile.TemporaryFile()
-            self.pipe_stdin.write(pipe_stdin)
-            self.pipe_stdin.flush()
-        #
-        self.pipe_stderr = stderr
-        self.pipe_cwd = cwd
-        self.pipe_env = env
-        self.pipe_export = export
-        self.pipe_text = text
-
-        self.commands = []
+        self.thread = None
+        self.output = None
+        self.error = None
     #
     def _build_env(self, env, export):
+        '''
+        Helper function to build an environment from a base environment.
+
+        env     --  Base environment
+        export  --  Dict of extra variables to include in new environment
+
+        If env is None, then os.environ is used as the base environment.
+        '''
         out_env = {}
         if env is None:
             for ev in os.environ:
@@ -109,86 +102,176 @@ class Pipeline:
 
         return out_env
     #
-    def append(self, command, cwd=None, env=None, export=None, text=None,
+
+#
+
+
+class PipeThread(threading.Thread):
+    def __init__(self, pipeline):
+        threading.Thread.__init__(self, name='pipeline')
+        self.pipeline = pipeline
+    #
+    def run(self):
+        '''
+        Runs the pipeline inside the thread, transmitting any standard
+        input data to the first process and collecting standard output and
+        standard error data from the last process.
+        '''
+        stdin = self.pipeline.stdin
+        temp = None
+
+        if self.pipeline.indata:
+            temp = tempfile.TemporaryFile()
+            data = self.pipeline.indata
+            if type(data) is str:
+                data = bytes(data, 'utf-8')
+            #
+            temp.write(data)
+            temp.flush()
+            temp.seek(0)
+            stdin = temp
+        #
+
+        prev_command = None
+        for item in self.pipeline.commands:
+            stdout = item.stdout
+            stderr = item.stderr
+
+            if prev_command:
+                if prev_command.stream == 2:
+                    stdin = prev_command.subproc.stderr
+                else:
+                    stdin = prev_command.subproc.stdout
+            #####
+
+            item.subproc = Popen(item.command, stdin=stdin,
+                             stdout=item.stdout, stderr=item.stderr,
+                             cwd=item.cwd, env=item.env, text=item.text)
+            #
+
+            if prev_command:
+                if prev_command.stream == 2:
+                    prev_command.subproc.stderr.close()
+                else:
+                    prev_command.subproc.stdout.close()
+            #####
+
+            prev_command = item
+        #
+
+        self.pipeline.output, self.pipeline.error = \
+            self.pipeline.commands[-1].subproc.communicate()
+        #
+
+        if temp:
+            temp.close()
+        #
+    #
+#
+
+
+class Pipeline:
+    def __init__(self, stdin=PIPE, indata=None, stdout=PIPE, stderr=PIPE,
+                 cwd=None, base_env=None, export=None, text=True):
+        '''
+        Constructor.
+
+        stdin     --  Standard input stream to first process
+        indata    --  Data to sent to first process (if stdin=PIPE)
+        stdout    --  Standard output stream of last process
+        stderr    --  Standard error stream of last process
+        cwd       --  Working directory for execution
+        base_env  --  Base environment (None for os.environ)
+        export    --  Additional environment variables (as dict)
+        '''
+
+        self.stdin = stdin
+        self.indata = indata
+        self.stdout = stdout
+        self.stderr = stderr
+        self.cwd = cwd
+        self.base_env = base_env
+        self.export = export
+        self.text = text
+
+        self.commands = []
+        self.output = None
+        self.error = None
+        self.thread = None
+    #
+    def append(self, command, cwd=None, base_env=None, export=None, text=None,
                pipe=PIPE_STDOUT):
         '''
         Appends a command to the pipeline
         '''
 
         if cwd is None:
-            cwd = self.pipe_cwd
+            cwd = self.cwd
+        #
+
+        if base_env is None:
+            base_env = self.base_env
+        #
+
+        if export is None:
+            export = self.export
         #
 
         if text is None:
-            text = self.pipe_text
+            text = self.text
         #
 
-        cmd = Command(command, cwd, self._build_env(env, export), text, pipe)
+        stdout = pipe['stdout']
+        stderr = pipe['stderr']
+
+        cmd = SubCommand(command, stdout, stderr, cwd, base_env, export, text)
         self.commands.append(cmd)
     #
     def launch(self):
         if len(self.commands) > 0:
-            self.commands[0].stdin = self.pipe_stdin
-            self.commands[-1].stdout = subprocess.PIPE
-            self.commands[-1].stderr = self.pipe_stderr
-            prev_command = None
-
-            for command in self.commands:
-                stdin = command.stdin
-                if prev_command:
-                    if prev_command.stream == 2:
-                        stdin = prev_command.subproc.stderr
-                    else:
-                        stdin = prev_command.subproc.stdout
-                    #
-                #
-
-                command.subproc = subprocess.Popen(command.command,
-                                        stdin=stdin, stdout=command.stdout,
-                                        stderr=command.stderr,
-                                        cwd=command.cwd, env=command.env,
-                                        text=command.text)
-
-                if prev_command:
-                    if prev_command.stream == 2:
-                        prev_command.subproc.stderr.close()
-                    else:
-                        prev_command.subproc.stdout.close()
-                    #
-                #
-            #
+            self.thread = PipeThread(self)
+            self.thread.start()
         #
     #
-    def poll(self):
-        code = None
-        for command in self.commands:
-            if command.subproc:
-                this_code = command.subproc.poll()
-                if this_code is not None:
-                    if code is None:
-                        code = this_code
-                    else:
-                        if code == 0:
-                            code = this_code
-        #################
-        return code
-    #
-    def wait(self, timeout=None):
-        total = 0
-        result = self.poll()
-        while result is None:
-            time.sleep(0.1)
-            total += 0.1
-
-            result = self.poll()
-            if result is None and timeout is not None:
-                if total >= timeout:
-                    raise subprocess.TimeoutExpired()
-                #
-            #
+    def is_running(self):
+        '''
+        Returns True iff the thread exists and is still running.
+        '''
+        result = False
+        if self.thread:
+            result = self.thread.is_alive()
         #
 
         return result
+    #
+    def wait(self, timeout=None):
+        '''
+        Waits for the thread and subcommand to terminate, then returns a
+        3-tuple containing the exit code, standard output data, and standard
+        error data. Uses busy waiting so that the threads can be interrupted
+        if required by calling code. An optional timeout (in seconds with
+        0.05 second granularity) is available. If set, a TimeoutExpired
+        exception is raised if the subcommand has not finished in timeout
+        seconds.
+        '''
+        code = None
+        total = 0
+        while self.is_running():
+            time.sleep(0.05)
+            total += 0.1
+
+            if timeout is not None:
+                if total >= timeout:
+                    raise TimeoutExpired()
+                #
+            #
+        #
+
+        if self.commands[-1].subproc:
+            code = self.commands[-1].subproc.returncode
+        #
+
+        return (code, self.output, self.error)
     #
     def send_signal(self, signal):
         for command in self.commands:
@@ -208,21 +291,53 @@ class Pipeline:
 #
 
 
-def subpipe(*args, stdin=None, stdin_text=False, stderr=None, cwd=None,
-            env=None, export=None, text=True):
+def subpipe(*args, stdin=None, indata=None, stdout=PIPE, stderr=None,
+               cwd=None, base_env=None, export=None, text=True):
     '''
-    Creates a pipeline of subprocesses and returns a Pipeline object.
+    Runs a pipeline of external commands and waits for completion. Each
+    external command may be specified as either a sequence of arguments or as
+    a string to be split with shlex. Returns a 3-tuple consisting of the exit
+    status, standard output data, and standard error data.
 
-    Each non-keyword argument to this function consists of a str, list, or
-    dict. A str or list argument specifies a command with default pipeline
-    attributes, while a dict is used whenever it is necessary to fine-tune
-    a single process in the pipeline.
+    stdin       --  Standard input stream to the first command
+    indata      --  Data to send to the first command's standard input
+    stdout      --  Standard output stream from the last command
+    stderr      --  Standard error stream from the last command
+    cwd         --  Working directory in which to run the commands
+    base_env    --  Base set of environment variables
+    export      --  Dictionary of additional environment variables
+    text        --  Use text streams to/from the commands
+
+    Note that sending indata to the pipeline requires stdin to be set to
+    PIPE. The stdin, stdout, and stderr streams can be set to a stream or
+    file handle (as permitted by the subprocess module), or to the special
+    values PIPE or DEVNULL. The stderr argument can be set to STDOUT to
+    merge the error data onto the output stream. Capturing a stream is
+    disabled by setting its corresponding argument to None. Capturing output
+    and error data requires stdout and stderr to be set to PIPE, respectively.
+
+    If base_env is None (the default), the os.environ (the environment seen
+    by the Python interpreter) is used as the base environment. Otherwise,
+    base_env must be set to a dictionary that will define the execution
+    environment. Note that PATH must be set unless the absolute path to the
+    command is given.
+
+    Additional environment variables can be added to the base environment
+    by passing a dictionary to the export argument. This dictionary maps
+    environment variable names to values.
     '''
-    pass
+    pipeline = Pipeline(stdin, indata, stdout, stderr, cwd, base_env, export,
+                        text)
+    for arg in args:
+        pipeline.append(arg)
+    #
+
+    pipeline.launch()
+    return pipeline.wait()
 #
 
 
 if __name__ == '__main__':
-    # TODO unit test code
-    pass
+    print(subpipe('cat', 'grep World', 'tr o 0', indata='Hello, World\n'))
+    print(subpipe('/usr/bin/env', export={'FOO': 'BAR'}))
 #
