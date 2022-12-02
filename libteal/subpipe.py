@@ -39,6 +39,8 @@ PIPE_BOTH = { 'stdout': PIPE, 'stderr': STDOUT, 'stream': 1 }
 PIPE_STDOUT_QUIET = { 'stdout': PIPE, 'stderr': DEVNULL, 'stream': 1 }
 PIPE_STDERR_QUIET = { 'stdout': DEVNULL, 'stderr': PIPE, 'stream': 2 }
 
+SLEEP_TIME = 0.000001
+
 
 class SubCommand:
     def __init__(self, command, stdout=PIPE, stderr=PIPE, cwd=None,
@@ -118,18 +120,26 @@ class PipeThread(threading.Thread):
         standard error data from the last process.
         '''
         stdin = self.pipeline.stdin
+        comm_indata = None
         temp = None
 
         if self.pipeline.indata:
-            temp = tempfile.TemporaryFile()
-            data = self.pipeline.indata
-            if type(data) is str:
-                data = bytes(data, 'utf-8')
+            if len(self.pipeline.commands) > 1:
+                temp = tempfile.TemporaryFile()
+                data = self.pipeline.indata
+                if type(data) is str:
+                    data = bytes(data, 'utf-8')
+                #
+                temp.write(data)
+                temp.flush()
+                temp.seek(0)
+                stdin = temp
+            else:
+                # We don't need a temporary input file with only 1 process in
+                # the pipeline, since the subprocess communicate method can
+                # handle this situation
+                comm_indata = self.pipeline.indata
             #
-            temp.write(data)
-            temp.flush()
-            temp.seek(0)
-            stdin = temp
         #
 
         prev_command = None
@@ -160,7 +170,7 @@ class PipeThread(threading.Thread):
         #
 
         self.pipeline.output, self.pipeline.error = \
-            self.pipeline.commands[-1].subproc.communicate()
+            self.pipeline.commands[-1].subproc.communicate(comm_indata)
         #
 
         if temp:
@@ -249,21 +259,23 @@ class Pipeline:
         Waits for the thread and subcommand to terminate, then returns a
         3-tuple containing the exit code, standard output data, and standard
         error data. Uses busy waiting so that the threads can be interrupted
-        if required by calling code. An optional timeout (in seconds with
-        0.05 second granularity) is available. If set, a TimeoutExpired
-        exception is raised if the subcommand has not finished in timeout
-        seconds.
+        if required by calling code. An optional timeout is available. If set,
+        a TimeoutExpired exception is raised if the subcommand has not
+        finished in timeout seconds.
         '''
         code = None
-        total = 0
+        start = time.time()
         while self.is_running():
-            time.sleep(0.05)
-            total += 0.1
-
             if timeout is not None:
-                if total >= timeout:
+                if (time.time() - start) >= timeout:
                     raise TimeoutExpired()
                 #
+            #
+
+            if self.is_running():
+                # Still running at the end of the timeout check, so yield
+                # the CPU from the main thread
+                time.sleep(SLEEP_TIME)
             #
         #
 
@@ -308,13 +320,13 @@ def subpipe(*args, stdin=None, indata=None, stdout=PIPE, stderr=None,
     export      --  Dictionary of additional environment variables
     text        --  Use text streams to/from the commands
 
-    Note that sending indata to the pipeline requires stdin to be set to
-    PIPE. The stdin, stdout, and stderr streams can be set to a stream or
-    file handle (as permitted by the subprocess module), or to the special
-    values PIPE or DEVNULL. The stderr argument can be set to STDOUT to
-    merge the error data onto the output stream. Capturing a stream is
-    disabled by setting its corresponding argument to None. Capturing output
-    and error data requires stdout and stderr to be set to PIPE, respectively.
+    Note that sending indata to the pipeline sets stdin to PIPE. The stdin,
+    stdout, and stderr streams can be set to a stream or file handle (as
+    permitted by the subprocess module), or to the special values PIPE or
+    DEVNULL. The stderr argument can be set to STDOUT to merge the error data
+    onto the output stream. Capturing a stream is disabled by setting its
+    corresponding argument to None. Capturing output and error data requires
+    stdout and stderr to be set to PIPE, respectively.
 
     If base_env is None (the default), the os.environ (the environment seen
     by the Python interpreter) is used as the base environment. Otherwise,
@@ -326,6 +338,16 @@ def subpipe(*args, stdin=None, indata=None, stdout=PIPE, stderr=None,
     by passing a dictionary to the export argument. This dictionary maps
     environment variable names to values.
     '''
+    if indata is not None:
+        stdin = PIPE
+
+        if text and type(indata) is bytes:
+            indata = str(indata, 'utf-8')
+        elif not text and type(indata) is str:
+            indata = bytes(indata, 'utf-8')
+        #
+    #
+
     pipeline = Pipeline(stdin, indata, stdout, stderr, cwd, base_env, export,
                         text)
     for arg in args:
@@ -338,6 +360,7 @@ def subpipe(*args, stdin=None, indata=None, stdout=PIPE, stderr=None,
 
 
 if __name__ == '__main__':
+    print(subpipe('cat', indata='Hello, World\n'))
     print(subpipe('cat', 'grep World', 'tr o 0', indata='Hello, World\n'))
     print(subpipe('/usr/bin/env', export={'FOO': 'BAR'}))
 #
